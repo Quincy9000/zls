@@ -1,0 +1,298 @@
+--- a/std/zig/Parse.zig
++++ b/std/zig/Parse.zig
+@@ -10,6 +10,9 @@
+ nodes: Ast.NodeList,
+ extra_data: std.ArrayList(u32),
+ scratch: std.ArrayList(Node.Index),
++/// Whether every `{` in the token list has a matching `}`; computed on first use.
++/// See `recoverListElement`.
++braces_balanced: ?bool = null,
+ 
+ fn tokenTag(p: *const Parse, token_index: TokenIndex) Token.Tag {
+     return p.tokens.items(.tag)[token_index];
+@@ -567,6 +570,54 @@
+     }
+ }
+ 
++fn bracesBalanced(p: *Parse) bool {
++    if (p.braces_balanced) |balanced| return balanced;
++    var level: usize = 0;
++    const balanced = for (p.tokens.items(.tag)) |tag| {
++        switch (tag) {
++            .l_brace => level += 1,
++            .r_brace => {
++                if (level == 0) break false;
++                level -= 1;
++            },
++            else => {},
++        }
++    } else level == 0;
++    p.braces_balanced = balanced;
++    return balanced;
++}
++
++/// Called when an element of a `{ ... }` list (an init list or switch prongs) fails to
++/// parse. Skips from the start of the element to the `,` or `}` that ends it, so the
++/// error stays inside the list. Otherwise it escapes to the enclosing statement, whose
++/// recovery doesn't know the list's `{` was opened and takes its `}` for the end of the
++/// block. That `}` can only be trusted when the file's braces balance; if they don't,
++/// the unclosed brace is likely in this list, and the error is passed on as before.
++fn recoverListElement(p: *Parse, element_start: TokenIndex) error{ParseError}!void {
++    if (!p.bracesBalanced()) return error.ParseError;
++    const error_tok = p.tok_i;
++    p.tok_i = element_start;
++    var braces: u32 = 0;
++    var parens_and_brackets: u32 = 0;
++    while (true) : (p.tok_i += 1) {
++        switch (p.tokenTag(p.tok_i)) {
++            .l_brace => braces += 1,
++            .r_brace => {
++                if (braces == 0) return;
++                braces -= 1;
++            },
++            .l_paren, .l_bracket => parens_and_brackets += 1,
++            .r_paren, .r_bracket => parens_and_brackets -|= 1,
++            .comma => if (braces == 0 and parens_and_brackets == 0) return,
++            .eof => {
++                p.tok_i = error_tok;
++                return error.ParseError;
++            },
++            else => {},
++        }
++    }
++}
++
+ /// TestDecl <- KEYWORD_test (STRINGLITERALSINGLE / IDENTIFIER)? Block
+ fn expectTestDecl(p: *Parse) Error!Node.Index {
+     const test_token = p.assertToken(.keyword_test);
+@@ -2260,28 +2311,21 @@
+ 
+     const scratch_top = p.scratch.items.len;
+     defer p.scratch.shrinkRetainingCapacity(scratch_top);
+-    const opt_field_init = try p.parseFieldInit();
+-    if (opt_field_init) |field_init| {
+-        try p.scratch.append(p.gpa, field_init);
+-        while (true) {
+-            switch (p.tokenTag(p.tok_i)) {
+-                .comma => p.tok_i += 1,
+-                .r_brace => {
+-                    p.tok_i += 1;
+-                    break;
+-                },
+-                .colon, .r_paren, .r_bracket => return p.failExpected(.r_brace),
+-                // Likely just a missing comma; give error but continue parsing.
+-                else => try p.warn(.expected_comma_after_initializer),
+-            }
+-            if (p.eatToken(.r_brace)) |_| break;
+-            const next = try p.expectFieldInit();
+-            try p.scratch.append(p.gpa, next);
+-        }
+-        const comma = (p.tokenTag(p.tok_i - 2)) == .comma;
+-        const inits = p.scratch.items[scratch_top..];
+-        std.debug.assert(inits.len != 0);
+-        if (inits.len <= 1) {
++    const is_field_list = try p.parseInitList();
++    const comma = (p.tokenTag(p.tok_i - 2)) == .comma;
++    const inits = p.scratch.items[scratch_top..];
++    if (inits.len == 0) {
++        return try p.addNode(.{
++            .tag = .struct_init_one,
++            .main_token = lbrace,
++            .data = .{ .node_and_opt_node = .{
++                lhs,
++                .none,
++            } },
++        });
++    }
++    if (is_field_list) {
++        if (inits.len == 1) {
+             return try p.addNode(.{
+                 .tag = if (comma) .struct_init_one_comma else .struct_init_one,
+                 .main_token = lbrace,
+@@ -2301,11 +2345,50 @@
+             });
+         }
+     }
++    if (inits.len == 1) {
++        return try p.addNode(.{
++            .tag = if (comma) .array_init_one_comma else .array_init_one,
++            .main_token = lbrace,
++            .data = .{ .node_and_node = .{
++                lhs,
++                inits[0],
++            } },
++        });
++    } else {
++        return try p.addNode(.{
++            .tag = if (comma) .array_init_comma else .array_init,
++            .main_token = lbrace,
++            .data = .{ .node_and_extra = .{
++                lhs,
++                try p.addExtra(try p.listToSpan(inits)),
++            } },
++        });
++    }
++}
+ 
++/// InitList
++///     <- LBRACE FieldInit (COMMA FieldInit)* COMMA? RBRACE
++///      / LBRACE Expr (COMMA Expr)* COMMA? RBRACE
++///      / LBRACE RBRACE
++///
++/// Parses the elements after the `{` (already consumed) and the closing `}`, appending
++/// them to `p.scratch`. Returns whether they are field inits. An element that fails to
++/// parse is left out; see `recoverListElement`.
++fn parseInitList(p: *Parse) Error!bool {
++    const is_field_list = p.tokenTag(p.tok_i) == .period and
++        p.tokenTag(p.tok_i + 1) == .identifier and
++        p.tokenTag(p.tok_i + 2) == .equal;
+     while (true) {
+         if (p.eatToken(.r_brace)) |_| break;
+-        const elem_init = try p.expectExpr();
+-        try p.scratch.append(p.gpa, elem_init);
++        const element_start = p.tok_i;
++        const element: ?Node.Index = (if (is_field_list) p.expectFieldInit() else p.expectExpr()) catch |err| switch (err) {
++            error.OutOfMemory => return error.OutOfMemory,
++            error.ParseError => skipped: {
++                try p.recoverListElement(element_start);
++                break :skipped null;
++            },
++        };
++        if (element) |node| try p.scratch.append(p.gpa, node);
+         switch (p.tokenTag(p.tok_i)) {
+             .comma => p.tok_i += 1,
+             .r_brace => {
+@@ -2317,34 +2400,7 @@
+             else => try p.warn(.expected_comma_after_initializer),
+         }
+     }
+-    const comma = (p.tokenTag(p.tok_i - 2)) == .comma;
+-    const inits = p.scratch.items[scratch_top..];
+-    switch (inits.len) {
+-        0 => return try p.addNode(.{
+-            .tag = .struct_init_one,
+-            .main_token = lbrace,
+-            .data = .{ .node_and_opt_node = .{
+-                lhs,
+-                .none,
+-            } },
+-        }),
+-        1 => return try p.addNode(.{
+-            .tag = if (comma) .array_init_one_comma else .array_init_one,
+-            .main_token = lbrace,
+-            .data = .{ .node_and_node = .{
+-                lhs,
+-                inits[0],
+-            } },
+-        }),
+-        else => return try p.addNode(.{
+-            .tag = if (comma) .array_init_comma else .array_init,
+-            .main_token = lbrace,
+-            .data = .{ .node_and_extra = .{
+-                lhs,
+-                try p.addExtra(try p.listToSpan(inits)),
+-            } },
+-        }),
+-    }
++    return is_field_list;
+ }
+ 
+ /// ErrorUnionExpr <- SuffixExpr (EXCLAMATIONMARK TypeExpr)?
+@@ -2591,66 +2647,15 @@
+ 
+                 const scratch_top = p.scratch.items.len;
+                 defer p.scratch.shrinkRetainingCapacity(scratch_top);
+-                const opt_field_init = try p.parseFieldInit();
+-                if (opt_field_init) |field_init| {
+-                    try p.scratch.append(p.gpa, field_init);
+-                    while (true) {
+-                        switch (p.tokenTag(p.tok_i)) {
+-                            .comma => p.tok_i += 1,
+-                            .r_brace => {
+-                                p.tok_i += 1;
+-                                break;
+-                            },
+-                            .colon, .r_paren, .r_bracket => return p.failExpected(.r_brace),
+-                            // Likely just a missing comma; give error but continue parsing.
+-                            else => try p.warn(.expected_comma_after_initializer),
+-                        }
+-                        if (p.eatToken(.r_brace)) |_| break;
+-                        const next = try p.expectFieldInit();
+-                        try p.scratch.append(p.gpa, next);
+-                    }
+-                    const comma = (p.tokenTag(p.tok_i - 2)) == .comma;
+-                    const inits = p.scratch.items[scratch_top..];
+-                    std.debug.assert(inits.len != 0);
+-                    if (inits.len <= 2) {
+-                        return try p.addNode(.{
+-                            .tag = if (comma) .struct_init_dot_two_comma else .struct_init_dot_two,
+-                            .main_token = lbrace,
+-                            .data = .{ .opt_node_and_opt_node = .{
+-                                if (inits.len >= 1) .fromOptional(inits[0]) else .none,
+-                                if (inits.len >= 2) .fromOptional(inits[1]) else .none,
+-                            } },
+-                        });
+-                    } else {
+-                        return try p.addNode(.{
+-                            .tag = if (comma) .struct_init_dot_comma else .struct_init_dot,
+-                            .main_token = lbrace,
+-                            .data = .{ .extra_range = try p.listToSpan(inits) },
+-                        });
+-                    }
+-                }
+-
+-                while (true) {
+-                    if (p.eatToken(.r_brace)) |_| break;
+-                    const elem_init = try p.expectExpr();
+-                    try p.scratch.append(p.gpa, elem_init);
+-                    switch (p.tokenTag(p.tok_i)) {
+-                        .comma => p.tok_i += 1,
+-                        .r_brace => {
+-                            p.tok_i += 1;
+-                            break;
+-                        },
+-                        .colon, .r_paren, .r_bracket => return p.failExpected(.r_brace),
+-                        // Likely just a missing comma; give error but continue parsing.
+-                        else => try p.warn(.expected_comma_after_initializer),
+-                    }
+-                }
++                const is_field_list = try p.parseInitList();
+                 const comma = (p.tokenTag(p.tok_i - 2)) == .comma;
+                 const inits = p.scratch.items[scratch_top..];
+                 if (inits.len <= 2) {
+                     return try p.addNode(.{
+                         .tag = if (inits.len == 0)
+                             .struct_init_dot_two
++                        else if (is_field_list)
++                            if (comma) .struct_init_dot_two_comma else .struct_init_dot_two
+                         else if (comma) .array_init_dot_two_comma else .array_init_dot_two,
+                         .main_token = lbrace,
+                         .data = .{ .opt_node_and_opt_node = .{
+@@ -2660,7 +2665,9 @@
+                     });
+                 } else {
+                     return try p.addNode(.{
+-                        .tag = if (comma) .array_init_dot_comma else .array_init_dot,
++                        .tag = if (is_field_list)
++                            if (comma) .struct_init_dot_comma else .struct_init_dot
++                        else if (comma) .array_init_dot_comma else .array_init_dot,
+                         .main_token = lbrace,
+                         .data = .{ .extra_range = try p.listToSpan(inits) },
+                     });
+@@ -3476,7 +3483,15 @@
+     defer p.scratch.shrinkRetainingCapacity(scratch_top);
+ 
+     while (true) {
+-        const item = try parseSwitchProng(p) orelse break;
++        const prong_start = p.tok_i;
++        const item = parseSwitchProng(p) catch |err| switch (err) {
++            error.OutOfMemory => return error.OutOfMemory,
++            error.ParseError => {
++                try p.recoverListElement(prong_start);
++                if (p.eatToken(.comma) == null) break;
++                continue;
++            },
++        } orelse break;
+ 
+         try p.scratch.append(p.gpa, item);
+ 
